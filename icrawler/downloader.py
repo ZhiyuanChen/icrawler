@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import hashlib
 
 from threading import current_thread
 
@@ -26,9 +27,10 @@ class Downloader(ThreadPool):
         thread_num (int): The number of downloader threads.
         lock (Lock): A threading.Lock object.
         storage (BaseStorage): storage backend.
+        hashset_size (int): size of hashset, 0 for not use.
     """
 
-    def __init__(self, thread_num, signal, session, storage):
+    def __init__(self, thread_num, signal, session, storage, hashset_size=0, hasher='md5'):
         """Init Parser with some shared variables."""
         super(Downloader, self).__init__(
             thread_num, out_queue=None, name='downloader')
@@ -37,6 +39,14 @@ class Downloader(ThreadPool):
         self.storage = storage
         self.file_idx_offset = 0
         self.clear_status()
+        self.hashset = set() if hashset_size else None
+        self.hashset_size = hashset_size
+        if type(hasher) == str:
+            self.hasher = getattr(hashlib, hasher)
+        elif callable(hasher):
+            self.hasher = hasher
+        else:
+            raise ValueError('hasher must be a str or a callable object, but got %s' % type(hasher))
 
     def clear_status(self):
         """Reset fetched_num to 0."""
@@ -78,16 +88,41 @@ class Downloader(ThreadPool):
         return '{:06d}.{}'.format(file_idx, extension)
 
     def reach_max_num(self):
-        """Check if downloaded images reached max num.
+        """Check if downloaded files reached max num.
 
         Returns:
-            bool: if downloaded images reached max num.
+            bool: if downloaded files reached max num.
         """
         if self.signal.get('reach_max_num'):
             return True
         if self.max_num > 0 and self.fetched_num >= self.max_num:
             return True
         else:
+            return False
+
+    def already_downloaded(self, content):
+        """Check if file has been downloaded.
+
+        Args:
+            content (str): The downloaded file content.
+
+        Returns:
+            bool: if file has been downloaded.
+        """
+        if self.hashset:
+            return False
+        try:
+            hasher = self.hasher()
+            hasher.update(content)
+            hashstr = hasher.hexdigest()
+            if hashstr in self.hashset:
+                return True
+            if len(self.hashset) < self.hashset_size:
+                self.hashset.add(hashstr)
+            else:
+                self.hashset = set()
+            return False
+        except AttributeError:
             return False
 
     def keep_file(self, task, response, **kwargs):
@@ -138,6 +173,8 @@ class Downloader(ThreadPool):
                                       response.status_code, file_url)
                     break
                 elif not self.keep_file(task, response, **kwargs):
+                    break
+                elif self.already_downloaded(response.content):
                     break
                 with self.lock:
                     self.fetched_num += 1
